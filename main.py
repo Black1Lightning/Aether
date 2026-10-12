@@ -42,7 +42,6 @@ AUDIUS_HOSTS = ("https://api.audius.co", "https://discoveryprovider.audius.co")
 
 
 def audius_get(path: str, params: dict | None = None, timeout: int = 6):
-    """GET-запрос к Audius API. Возвращает поле `data` ответа; пробует хосты по очереди."""
     query = urllib.parse.urlencode({**(params or {}), "app_name": AUDIUS_APP_NAME})
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     last = None
@@ -252,7 +251,6 @@ class SearchWorker(QThread):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 if prefix == "ytmusic":
-                    # В yt-dlp нет префикса "ytmusicsearch" — используем URL поиска YouTube Music
                     target_query = "https://music.youtube.com/search?q=" + urllib.parse.quote(self.query) + "#songs"
                 elif prefix:
                     target_query = f"{prefix}{self.limit}:{self.query}"
@@ -264,7 +262,6 @@ class SearchWorker(QThread):
                     if not e or not e.get("id"):
                         continue
                     if prefix == "ytmusic":
-                        # только реальные треки: у альбомов/плейлистов/артистов нет прямой ссылки на видео
                         e_url = e.get("webpage_url") or e.get("url") or ""
                         if "watch?v=" not in e_url and len(str(e.get("id"))) != 11:
                             continue
@@ -294,7 +291,6 @@ class SearchWorker(QThread):
             for e in data:
                 if not e or not e.get("id"):
                     continue
-                # пропускаем удалённые, скрытые и платные/закрытые треки — их нельзя проиграть
                 if e.get("is_delete") or e.get("is_unlisted") or e.get("is_streamable") is False:
                     continue
                 if (e.get("access") or {}).get("stream") is False:
@@ -308,7 +304,7 @@ class SearchWorker(QThread):
                     "title": e.get("title") or "Без названия",
                     "artist": user.get("name") or user.get("handle") or "Неизвестно",
                     "duration": int(e.get("duration") or 0),
-                    "url": track_id,  # псевдо-схема; StreamFetchWorker сам запросит поток у Audius
+                    "url": track_id,
                     "thumbnail": thumb,
                     "source": "Audius",
                 })
@@ -351,7 +347,6 @@ class SearchWorker(QThread):
             sc_tracks = results.get("sc", [])
             audius_tracks = results.get("audius", [])
 
-            # Объединяем результаты трёх сервисов чередованием
             final_tracks = []
             provider_lists = (yt_tracks, sc_tracks, audius_tracks)
             for i in range(max(len(lst) for lst in provider_lists)):
@@ -377,14 +372,12 @@ class StreamFetchWorker(QThread):
 
     def _fetch_audius(self):
         track_id = urllib.parse.quote(self.page_url.split(":", 1)[1], safe="")
-        # no_redirect=true -> API возвращает прямую ссылку на поток вместо 302-редиректа
         url = audius_get(f"/v1/tracks/{track_id}/stream", {"no_redirect": "true"})
         if not isinstance(url, str) or not url.startswith("http"):
             url = (f"{AUDIUS_HOSTS[0]}/v1/tracks/{track_id}/stream?"
                    + urllib.parse.urlencode({"app_name": AUDIUS_APP_NAME}))
         headers = {"User-Agent": "Mozilla/5.0"}
 
-        # Узнаём полный размер файла, чтобы локальный прокси корректно обрабатывал перемотку
         size = 0
         try:
             req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
@@ -400,7 +393,7 @@ class StreamFetchWorker(QThread):
         self.stream_ready.emit(self.token, {
             "url": url, "headers": headers, "size": size,
             "mime": "audio/mpeg", "ext": "mp3", "is_hls": False,
-            "direct": size == 0,  # размер неизвестен -> отдаём URL плееру напрямую, без прокси
+            "direct": size == 0,
             "thumbnail": None,
         })
 
