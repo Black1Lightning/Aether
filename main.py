@@ -37,6 +37,24 @@ from PyQt6.QtWidgets import (
 SEARCH_CACHE: dict[str, list] = {}
 COVER_CACHE: dict[str, bytes] = {}
 
+AUDIUS_APP_NAME = "Aether"
+AUDIUS_HOSTS = ("https://api.audius.co", "https://discoveryprovider.audius.co")
+
+
+def audius_get(path: str, params: dict | None = None, timeout: int = 6):
+    """GET-запрос к Audius API. Возвращает поле `data` ответа; пробует хосты по очереди."""
+    query = urllib.parse.urlencode({**(params or {}), "app_name": AUDIUS_APP_NAME})
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    last = None
+    for host in AUDIUS_HOSTS:
+        try:
+            req = urllib.request.Request(f"{host}{path}?{query}", headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("data")
+        except Exception as ex:
+            last = ex
+    raise OSError(f"Audius API недоступен: {last}")
+
 
 def get_app_dir() -> Path:
     if os.name == "nt":
@@ -216,69 +234,42 @@ class SearchWorker(QThread):
     results_ready = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, query: str, limit: int = 25):
+    def __init__(self, query: str, limit: int = 15):
         super().__init__()
         self.query = query.strip()
         self.limit = limit
 
-    def _search_yandex(self) -> list:
-        encoded_q = urllib.parse.quote(self.query)
-        url = f"https://music.yandex.ru/handlers/music-search.jsx?text={encoded_q}&type=tracks"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                data = json.loads(resp.read())
-
-            tracks_data = data.get("tracks") or {}
-            tracks_raw = tracks_data.get("items") or tracks_data.get("results") or []
-
-            parsed = []
-            for item in tracks_raw[:self.limit]:
-                t_id = item.get("id")
-                albums = item.get("albums") or []
-                alb_id = albums[0].get("id") if albums else None
-                if not t_id or not alb_id:
-                    continue
-                
-                artists = ", ".join(a.get("name") for a in item.get("artists", []) if a.get("name")) or "Неизвестно"
-                title = item.get("title") or "Без названия"
-                duration = (item.get("durationMs") or 0) // 1000
-
-                cover_uri = item.get("coverUri") or (albums[0].get("coverUri") if albums else None)
-                thumb = f"https://{cover_uri.replace('%%', '200x200')}" if cover_uri else None
-
-                parsed.append({
-                    "id": f"ym_{t_id}",
-                    "title": title,
-                    "artist": artists,
-                    "duration": duration,
-                    "url": f"https://music.yandex.ru/album/{alb_id}/track/{t_id}",
-                    "thumbnail": thumb,
-                })
-            return parsed
-        except Exception:
-            return []
-
-    def _search_ytdlp(self, prefix: str) -> list:
+    def _search_ytdlp(self, prefix: str, source_name: str = "Ссылка") -> list:
         opts = {
             "quiet": True,
             "no_warnings": True,
             "extract_flat": True,
             "skip_download": True,
             "socket_timeout": 5,
+            "playlistend": self.limit,
         }
         tracks = []
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                target_query = f"{prefix}{self.limit}:{self.query}" if prefix else self.query
+                if prefix == "ytmusic":
+                    # В yt-dlp нет префикса "ytmusicsearch" — используем URL поиска YouTube Music
+                    target_query = "https://music.youtube.com/search?q=" + urllib.parse.quote(self.query) + "#songs"
+                elif prefix:
+                    target_query = f"{prefix}{self.limit}:{self.query}"
+                else:
+                    target_query = self.query
                 info = ydl.extract_info(target_query, download=False)
                 entries = info.get("entries", []) if "entries" in (info or {}) else [info]
                 for e in entries or []:
                     if not e or not e.get("id"):
                         continue
+                    if prefix == "ytmusic":
+                        # только реальные треки: у альбомов/плейлистов/артистов нет прямой ссылки на видео
+                        e_url = e.get("webpage_url") or e.get("url") or ""
+                        if "watch?v=" not in e_url and len(str(e.get("id"))) != 11:
+                            continue
+                        if not e.get("title"):
+                            continue
                     thumb = e.get("thumbnail")
                     if not thumb and e.get("thumbnails"):
                         thumb = e.get("thumbnails")[-1].get("url")
@@ -290,9 +281,39 @@ class SearchWorker(QThread):
                         "duration": int(e.get("duration") or 0),
                         "url": e.get("webpage_url") or e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
                         "thumbnail": thumb,
+                        "source": source_name,
                     })
-        except Exception:
-            pass
+        except Exception as ex:
+            print(f"[search:{source_name}] {ex}", file=sys.stderr)
+        return tracks
+
+    def _search_audius(self) -> list:
+        tracks = []
+        try:
+            data = audius_get("/v1/tracks/search", {"query": self.query, "limit": self.limit}) or []
+            for e in data:
+                if not e or not e.get("id"):
+                    continue
+                # пропускаем удалённые, скрытые и платные/закрытые треки — их нельзя проиграть
+                if e.get("is_delete") or e.get("is_unlisted") or e.get("is_streamable") is False:
+                    continue
+                if (e.get("access") or {}).get("stream") is False:
+                    continue
+                art = e.get("artwork") or {}
+                thumb = art.get("480x480") or art.get("1000x1000") or art.get("150x150")
+                user = e.get("user") or {}
+                track_id = f"audius:{e['id']}"
+                tracks.append({
+                    "id": track_id,
+                    "title": e.get("title") or "Без названия",
+                    "artist": user.get("name") or user.get("handle") or "Неизвестно",
+                    "duration": int(e.get("duration") or 0),
+                    "url": track_id,  # псевдо-схема; StreamFetchWorker сам запросит поток у Audius
+                    "thumbnail": thumb,
+                    "source": "Audius",
+                })
+        except Exception as ex:
+            print(f"[search:Audius] {ex}", file=sys.stderr)
         return tracks
 
     def run(self):
@@ -306,16 +327,16 @@ class SearchWorker(QThread):
 
         try:
             if self.query.startswith("http://") or self.query.startswith("https://"):
-                tracks = self._search_ytdlp("")
+                tracks = self._search_ytdlp("", source_name="Прямая ссылка")
                 self.results_ready.emit(tracks)
                 return
 
             results = {}
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
-                    executor.submit(self._search_ytdlp, "ytmusicsearch"): "ytmusic",
-                    executor.submit(self._search_ytdlp, "scsearch"): "sc",
-                    executor.submit(self._search_yandex): "ym",
+                    executor.submit(self._search_ytdlp, "ytmusic", "YouTube Music"): "ytmusic",
+                    executor.submit(self._search_ytdlp, "scsearch", "SoundCloud"): "sc",
+                    executor.submit(self._search_audius): "audius",
                 }
                 for future in as_completed(futures):
                     service = futures[future]
@@ -324,12 +345,19 @@ class SearchWorker(QThread):
                     except Exception:
                         results[service] = []
 
-            final_tracks = (
-                results.get("ytmusic")
-                or results.get("sc")
-                or results.get("ym")
-                or []
-            )
+            yt_tracks = results.get("ytmusic", [])
+            if not yt_tracks:
+                yt_tracks = self._search_ytdlp("ytsearch", "YouTube")
+            sc_tracks = results.get("sc", [])
+            audius_tracks = results.get("audius", [])
+
+            # Объединяем результаты трёх сервисов чередованием
+            final_tracks = []
+            provider_lists = (yt_tracks, sc_tracks, audius_tracks)
+            for i in range(max(len(lst) for lst in provider_lists)):
+                for lst in provider_lists:
+                    if i < len(lst):
+                        final_tracks.append(lst[i])
 
             if final_tracks:
                 SEARCH_CACHE[self.query] = final_tracks
@@ -347,7 +375,43 @@ class StreamFetchWorker(QThread):
         super().__init__()
         self.token, self.page_url = token, page_url
 
+    def _fetch_audius(self):
+        track_id = urllib.parse.quote(self.page_url.split(":", 1)[1], safe="")
+        # no_redirect=true -> API возвращает прямую ссылку на поток вместо 302-редиректа
+        url = audius_get(f"/v1/tracks/{track_id}/stream", {"no_redirect": "true"})
+        if not isinstance(url, str) or not url.startswith("http"):
+            url = (f"{AUDIUS_HOSTS[0]}/v1/tracks/{track_id}/stream?"
+                   + urllib.parse.urlencode({"app_name": AUDIUS_APP_NAME}))
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        # Узнаём полный размер файла, чтобы локальный прокси корректно обрабатывал перемотку
+        size = 0
+        try:
+            req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                m = re.match(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range", ""))
+                if m:
+                    size = int(m.group(1))
+                elif r.status == 200:
+                    size = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            pass
+
+        self.stream_ready.emit(self.token, {
+            "url": url, "headers": headers, "size": size,
+            "mime": "audio/mpeg", "ext": "mp3", "is_hls": False,
+            "direct": size == 0,  # размер неизвестен -> отдаём URL плееру напрямую, без прокси
+            "thumbnail": None,
+        })
+
     def run(self):
+        if self.page_url.startswith("audius:"):
+            try:
+                self._fetch_audius()
+            except Exception as ex:
+                self.failed.emit(self.token, str(ex))
+            return
+
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -358,6 +422,13 @@ class StreamFetchWorker(QThread):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.page_url, download=False)
+            if "url" not in info:
+                if info.get("entries"):
+                    info = next(iter(info["entries"]))
+                elif info.get("requested_formats"):
+                    info = {**info, **info["requested_formats"][0]}
+                elif info.get("formats"):
+                    info = {**info, **info["formats"][-1]}
             url = info["url"]
             headers = dict(info.get("http_headers") or {})
             
@@ -525,12 +596,16 @@ class SidebarWidget(QFrame):
 
 class TrackTableWidget(QTableWidget):
     track_chosen = pyqtSignal(int)
-    COL_ALIGN = {0: Qt.AlignmentFlag.AlignCenter, 3: Qt.AlignmentFlag.AlignRight}
+    COL_ALIGN = {
+        0: Qt.AlignmentFlag.AlignCenter,
+        3: Qt.AlignmentFlag.AlignCenter,
+        4: Qt.AlignmentFlag.AlignRight,
+    }
 
     def __init__(self):
-        super().__init__(0, 4)
+        super().__init__(0, 5)
         self.tracks: list[dict] = []
-        self.setHorizontalHeaderLabels(["№", "Название", "Исполнитель", "Время"])
+        self.setHorizontalHeaderLabels(["№", "Название", "Исполнитель", "Источник", "Время"])
         self.verticalHeader().hide()
         self.setShowGrid(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -549,14 +624,18 @@ class TrackTableWidget(QTableWidget):
         h.setHighlightSections(False)
         h.setStretchLastSection(False)
         for c, al in self.COL_ALIGN.items():
-            self.horizontalHeaderItem(c).setTextAlignment(al | Qt.AlignmentFlag.AlignVCenter)
+            header_item = self.horizontalHeaderItem(c)
+            if header_item:
+                header_item.setTextAlignment(al | Qt.AlignmentFlag.AlignVCenter)
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(0, 44)
-        self.setColumnWidth(2, 220)
-        self.setColumnWidth(3, 70)
+        self.setColumnWidth(2, 180)
+        self.setColumnWidth(3, 130)
+        self.setColumnWidth(4, 70)
         self.verticalHeader().setDefaultSectionSize(44)
         self.cellClicked.connect(lambda r, _c: self.track_chosen.emit(r))
 
@@ -565,11 +644,12 @@ class TrackTableWidget(QTableWidget):
         self.setRowCount(len(tracks))
         for r, t in enumerate(tracks):
             dur = fmt_time(t["duration"] * 1000) if t.get("duration") else "--:--"
-            for c, text in enumerate([str(r + 1), t["title"], t["artist"], dur]):
+            source = t.get("source", "—")
+            for c, text in enumerate([str(r + 1), t["title"], t["artist"], source, dur]):
                 it = QTableWidgetItem(text)
                 it.setTextAlignment(self.COL_ALIGN.get(c, Qt.AlignmentFlag.AlignLeft)
                                     | Qt.AlignmentFlag.AlignVCenter)
-                if c in (0, 2, 3):
+                if c in (0, 2, 3, 4):
                     it.setForeground(Qt.GlobalColor.lightGray if c != 2 else Qt.GlobalColor.white)
                 self.setItem(r, c, it)
 
@@ -804,7 +884,7 @@ class MainWindow(QMainWindow):
         w, lay = self._page()
         h = QLabel("Добро пожаловать в Aether")
         h.setObjectName("h1")
-        sub = QLabel("Слушайте музыку без границ. Поддерживаются YouTube Music, SoundCloud, Яндекс Музыка и другие платформы.")
+        sub = QLabel("Слушайте музыку без границ. Поддерживаются YouTube Music, SoundCloud, Audius и другие платформы.")
         sub.setObjectName("muted")
         lay.addWidget(h)
         lay.addWidget(sub)
@@ -903,7 +983,7 @@ class MainWindow(QMainWindow):
         if token != self.token:
             return
         
-        if src.get("is_hls"):
+        if src.get("is_hls") or src.get("direct"):
             self.player.setSource(QUrl(src["url"]))
         else:
             self.player.setSource(QUrl(self.proxy.open(token, src)))
