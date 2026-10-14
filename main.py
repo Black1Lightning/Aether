@@ -406,6 +406,83 @@ def search_tracks(query: str, use_zvuk: bool, limit: int = 15) -> tuple[list, st
 
 # ───────────────────────────── Получение потока и обложек ─────────────────────────────
 
+def download_hls_in_memory(m3u8_url: str, headers: dict | None = None) -> tuple[bytes, str, str]:
+    """Скачивает HLS-поток в единый байтовый массив в ОЗУ.
+    Возвращает (data_bytes, mime_type, extension).
+    """
+    req_headers = {**UA, **(headers or {})}
+
+    def _get_text(url: str) -> str:
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    content = _get_text(m3u8_url)
+
+    # Разбор Master Playlist при наличии #EXT-X-STREAM-INF
+    if "#EXT-X-STREAM-INF" in content:
+        lines = content.splitlines()
+        variant_url = None
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                for j in range(i + 1, len(lines)):
+                    candidate = lines[j].strip()
+                    if candidate and not candidate.startswith("#"):
+                        variant_url = urllib.parse.urljoin(m3u8_url, candidate)
+                        break
+                if variant_url:
+                    break
+        if variant_url:
+            m3u8_url = variant_url
+            content = _get_text(m3u8_url)
+
+    # Извлечение инициализирующего и аудио сегментов
+    init_url = None
+    segment_urls = []
+
+    map_match = re.search(r'#EXT-X-MAP:URI=["\']?([^"\',\s]+)["\']?', content)
+    if map_match:
+        init_url = urllib.parse.urljoin(m3u8_url, map_match.group(1))
+
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            segment_urls.append(urllib.parse.urljoin(m3u8_url, line))
+
+    if not segment_urls:
+        raise ValueError("HLS плейлист не содержит сегментов для воспроизведения")
+
+    all_urls = []
+    if init_url:
+        all_urls.append(init_url)
+    all_urls.extend(segment_urls)
+
+    def _download_chunk(url: str) -> bytes:
+        r = urllib.request.Request(url, headers=req_headers)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(r, timeout=10) as resp:
+                    return resp.read()
+            except Exception:
+                time.sleep(0.1 * (attempt + 1))
+        return b""
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        chunks = list(pool.map(_download_chunk, all_urls))
+
+    full_bytes = b"".join(chunks)
+
+    ext, mime = "m4a", "audio/mp4"
+    if init_url or any(u.rsplit("?", 1)[0].endswith((".m4s", ".mp4", ".m4a")) for u in segment_urls):
+        ext, mime = "m4a", "audio/mp4"
+    elif any(u.rsplit("?", 1)[0].endswith((".ts", ".tsv")) for u in segment_urls):
+        ext, mime = "ts", "video/mp2t"
+    elif any(u.rsplit("?", 1)[0].endswith((".aac", ".aacp")) for u in segment_urls):
+        ext, mime = "aac", "audio/aac"
+
+    return full_bytes, mime, ext
+
+
 def _http_stream(url: str, headers: dict) -> dict:
     size = 0
     try:
@@ -419,7 +496,7 @@ def _http_stream(url: str, headers: dict) -> dict:
     except Exception:
         pass
     return {"url": url, "headers": headers, "size": size, "mime": "audio/mpeg", "ext": "mp3",
-            "is_hls": False, "direct": size == 0, "thumbnail": None}
+            "is_hls": False, "direct": size == 0, "thumbnail": None, "buffer": None}
 
 
 def fetch_stream(page_url: str) -> dict:
@@ -450,14 +527,23 @@ def fetch_stream(page_url: str) -> dict:
             info = {**info, **info["formats"][-1]}
     url = info["url"]
     is_hls = "m3u8" in url or "m3u8" in info.get("protocol", "")
+    thumb = pick_thumb(info)
+
+    if is_hls:
+        hls_headers = dict(info.get("http_headers") or {})
+        buf_data, mime, ext = download_hls_in_memory(url, hls_headers)
+        return {"url": url, "headers": hls_headers, "size": len(buf_data),
+                "mime": mime, "ext": ext, "is_hls": False, "direct": False,
+                "buffer": buf_data, "thumbnail": thumb}
+
     ext = info.get("ext") or "m4a"
-    mime = "application/x-mpegURL" if is_hls else {
-        "m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm"}.get(ext, "audio/mpeg")
+    mime = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm"}.get(ext, "audio/mpeg")
     size = int(info.get("filesize") or info.get("filesize_approx") or 0)
-    if not is_hls and not size:
+    if not size:
         size = 50 * 1024 * 1024
     return {"url": url, "headers": dict(info.get("http_headers") or {}), "size": size,
-            "mime": mime, "ext": ext, "is_hls": is_hls, "thumbnail": pick_thumb(info)}
+            "mime": mime, "ext": ext, "is_hls": False, "buffer": None,
+            "direct": False, "thumbnail": thumb}
 
 
 def fetch_cover(url: str) -> bytes:
@@ -530,10 +616,59 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         raise OSError(f"fetch failed: {last}")
 
     def _serve(self, head: bool):
-        src = self.server.source
+        path_str = self.path.split("?")[0].lstrip("/")
+        token_part = path_str.split(".")[0]
+        src = None
+        if token_part.isdigit():
+            src = getattr(self.server, "sources", {}).get(int(token_part))
+        if not src:
+            src = getattr(self.server, "source", None)
+
         if not src:
             self.send_error(404)
             return
+
+        # Отдача трека из оперативной памяти (для SoundCloud HLS и буферизованных файлов)
+        buf = src.get("buffer")
+        if buf is not None:
+            total = len(buf)
+            start, end, status = 0, total - 1, 200
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+            if m and (m.group(1) or m.group(2)):
+                status = 206
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), total - 1)
+                else:
+                    start = max(0, total - int(m.group(2)))
+            if start > end or start >= total:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{total}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(status)
+            self.send_header("Content-Type", src["mime"])
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.end_headers()
+            if head:
+                return
+            pos = start
+            chunk_size = 256 * 1024
+            try:
+                while pos <= end:
+                    chunk = buf[pos : min(pos + chunk_size, end + 1)]
+                    self.wfile.write(chunk)
+                    pos += len(chunk)
+            except OSError:
+                pass
+            return
+
+        # Прямое сетевое проксирование
         total = src["size"]
         start, end, status = 0, total - 1, 200
         m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
@@ -581,10 +716,12 @@ class StreamProxy:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
         self.httpd.daemon_threads = True
         self.httpd.source = None
+        self.httpd.sources = {}
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def open(self, token: int, src: dict) -> str:
+        self.httpd.sources[token] = src
         self.httpd.source = src
         return f"http://127.0.0.1:{self.port}/{token}.{src['ext']}"
 
@@ -1334,7 +1471,9 @@ class MainWindow(QMainWindow):
     def _on_stream(self, token: int, src: dict):
         if token != self.token:
             return
-        if src.get("is_hls") or src.get("direct"):
+        if src.get("buffer") is not None:
+            self.player.setSource(QUrl(self.proxy.open(token, src)))
+        elif src.get("is_hls") or src.get("direct"):
             self.player.setSource(QUrl(src["url"]))
         else:
             self.player.setSource(QUrl(self.proxy.open(token, src)))
